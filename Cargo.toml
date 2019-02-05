@@ -1,0 +1,17 @@
+[package]
+name      = "elf_loader"
+version   = "0.1.0"
+authors   = ["Evrey <evrey@hackish.codes>"]
+publish   = false
+edition   = "2018"
+
+keywords    = ["no_std", "no-std", "embedded", "system", "os", "elf", "elf64"]
+categories  = ["embedded", "no-std", "parser-implementations"]
+license     = "MIT"
+readme      = "README.md"
+description = """
+A small and reliable ELF loader for re-locatable ELF64 programs.
+
+Eventually, this crate is supposed to be usable as a drop-in replacement
+for `dlopen`, or as the ELF loader of an operating system.
+"""
