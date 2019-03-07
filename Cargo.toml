@@ -1,6 +1,6 @@
 [package]
 name      = "elf_loader"
-version   = "0.1.0"
+version   = "0.1.1"
 authors   = ["Evrey <evrey@hackish.codes>"]
 publish   = false
 edition   = "2018"
@@ -15,3 +15,8 @@ A small and reliable ELF loader for re-locatable ELF64 programs.
 Eventually, this crate is supposed to be usable as a drop-in replacement
 for `dlopen`, or as the ELF loader of an operating system.
 """
+
+
+
+[dev-dependencies]
+libc = "0.2"

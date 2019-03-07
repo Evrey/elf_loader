@@ -39,6 +39,7 @@ pub const R_X86_64_RELATIVE: u32 = 8;
 
 
 
+#[derive(Copy, Clone)]
 #[repr(C)]
 pub struct ElfFileHeader {
     pub e_ident:     [u8; 16],
@@ -57,6 +58,7 @@ pub struct ElfFileHeader {
     pub e_shstrndx:  u16,
 }
 
+#[derive(Copy, Clone)]
 #[repr(C)]
 pub struct ElfProgramHeader {
     pub p_type:   u32,
@@ -69,18 +71,21 @@ pub struct ElfProgramHeader {
     pub p_align:  u64,
 }
 
+#[derive(Copy, Clone)]
 #[repr(C)]
 pub struct ElfDyn {
     pub d_tag: u64,
     pub d_val: u64,
 }
 
+#[derive(Copy, Clone)]
 #[repr(C)]
 pub struct ElfRel {
     pub r_offset: u64,
     pub r_info:   u64,
 }
 
+#[derive(Copy, Clone)]
 #[repr(C)]
 pub struct ElfRela {
     pub r_offset: u64,

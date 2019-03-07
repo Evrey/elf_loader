@@ -66,6 +66,12 @@ pub enum ParseElfError {
     /// A program header wants some impressive virtual memory allocation.
     BadVmemRange = 12,
 
+    /// A program header wants to load more bytes into a segment than the segment is in size.
+    PhSmallerThanVmem = 13,
+
+    /// A program header wants to align its segment to more than 4GiB.
+    ExcessiveAlignment = 14,
+
     #[doc(hidden)] _Reserved,
 }
 
@@ -78,7 +84,7 @@ pub enum LoadElfError {
     /// The given buffer is not big enough to load the ELF segments into.
     BadBufferSize = 0,
 
-    /// The given buffer is not page-aligned.
+    /// The given buffer is not properly aligned.
     BadBufferAlignment = 1,
 
     /// The ELF loader only supports a limited number of segments of different kinds
@@ -121,41 +127,47 @@ pub enum RelocElfError {
     /// The given base address does not fulfill the ELF's alignment requirements.
     BadBaseAddressAlignment = 0,
 
+    /// The `Dyn` array pointed at by the ELF is out of the ELF's memory region's bounds.
+    BadDynRange = 1,
+
+    /// The `Dyn` array pointed at by the ELF is not properly aligned.
+    BadDynAlignment = 2,
+
     /// The `PT_DYNAMIC` segment reported a bad `Rel` size.
-    BadRelSize,
+    BadRelSize = 3,
 
     /// The `PT_DYNAMIC` segment reported a bad `Rela` size.
-    BadRelaSize,
+    BadRelaSize = 4,
 
     /// The `PT_DYNAMIC` segment reported a memory range for the re-location
     /// tables that is out of bounds.
-    BadRelRelaTableRange,
+    BadRelRelaTableRange = 5,
 
     /// The `PT_DYNAMIC` segment reported a memory range for the re-location
     /// tables that is under-aligned.
-    BadRelRelaTableAlignment,
+    BadRelRelaTableAlignment = 6,
 
     /// A `Rel` table entry wants to modify memory out of range.
-    BadRelOffset,
+    BadRelOffset = 7,
 
     /// The `Rel` table contains unsupported re-locations.
-    UnsupportedRelType,
+    UnsupportedRelType = 8,
 
     /// `Rel` is currently not supported for the target CPU architecture.
-    UnsupportedRelArch,
+    UnsupportedRelArch = 9,
 
     /// A `Rela` table entry wants to modify memory out of range.
-    BadRelaOffset,
+    BadRelaOffset = 10,
 
     /// The `Rela` table contains unsupported re-locations.
-    UnsupportedRelaType,
+    UnsupportedRelaType = 11,
 
     /// `Rela` is currently not supported for the target CPU architecture.
-    UnsupportedRelaArch,
+    UnsupportedRelaArch = 12,
 
     /// An attempt of restricting memory access rights for a region of the loaded ELF's
     /// memory failed.
-    MemProtectFailed,
+    MemProtectFailed = 13,
 
     #[doc(hidden)] _Reserved,
 }
@@ -173,9 +185,9 @@ impl ParseElfError {
                                       ELF headers; to be extra sure, page-align your ELF buffer",
             BufferNotElf          => "The ELF buffer does not contain an ELF magic number",
             BadHeaderSize         => "The ELF buffer's reported header size does not match the \
-                                      loader's expected header size of 64 bytes", // TODO assert
+                                      loader's expected header size of 64 bytes",
             BadProgramHeaderSize  => "The ELF buffer's reported program header size does not match \
-                                      the loader's expected program header size of 56 bytes", //TODO
+                                      the loader's expected program header size of 56 bytes",
             NotElf64              => "Currently, this loader only supports the ELF64 format, but \
                                       the given buffer does not contain ELF64 data",
             NotPic                => "The ELF buffer does not contain position-independent code, \
@@ -194,6 +206,11 @@ impl ParseElfError {
             BadVmemRange          => "One of the ELF's program headers reported a virtual buffer \
                                       range that is over 4GiB in size or goes past the 4GiB \
                                       virtual address range",
+            PhSmallerThanVmem     => "One of the ELF's program headers reported a segment file \
+                                      size that is bigger then the loaded ELF's segment's virtual \
+                                      memory size",
+            ExcessiveAlignment    => "One of the ELF's program headers reported a segment \
+                                      alignment to more than 4GiB",
 
             _Reserved => "",
         }
@@ -211,7 +228,7 @@ impl LoadElfError {
 
         match *self {
             BadBufferSize           => "The given buffer is not big enough to load the ELF into",
-            BadBufferAlignment      => "The given buffer is not page-aligned",
+            BadBufferAlignment      => "The given buffer is not properly aligned",
             TooManySegments         => "The program headers describe more than 8 segments", // TODO
             MultipleDynamicSegments => "There is more than one `PT_DYNAMIC` segment",
             NoDynamicSegments       => "There is no `PT_DYNAMIC` segment, but this loader only \
@@ -233,12 +250,16 @@ impl RelocElfError {
 
         match *self {
             BadBaseAddressAlignment  => "The given base address is not page-aligned",
+            BadDynRange              => "The `Dyn` array pointed at by the ELF's program headers \
+                                         goes past the ELF's memory region's bounds",
+            BadDynAlignment          => "The `Dyn` array pointed at by the ELF's program headers \
+                                         is not properly aligned for `Dyn` structs",
             BadRelSize               => "The `PT_DYNAMIC` segment reported a struct size of the \
                                          `Rel` array that does not match the loader's expected \
-                                         size of 16 bytes", // TODO static assert
+                                         size of 16 bytes",
             BadRelaSize              => "The `PT_DYNAMIC` segment reported a struct size of the \
                                          `Rela` array that does not match the loader's expected \
-                                         size of 24 bytes", // TODO static assert
+                                         size of 24 bytes",
             BadRelRelaTableRange     => "The `PT_DYNAMIC` segment reported a `Rel` or `Rela` array \
                                          that goes past the bounds of the loaded ELF's memory \
                                          region",
@@ -308,4 +329,23 @@ impl From<LoadElfError> for ElfError {
 
 impl From<RelocElfError> for ElfError {
     #[inline] fn from(e: RelocElfError) -> Self { ElfError::Reloc(e) }
+}
+
+
+
+#[allow(dead_code)]
+mod static_assert {
+    use core::mem::size_of as sz;
+    use crate::elf::*;
+
+    const fn assert(expr: bool) -> () {
+        const A: [(); 1] = [()];
+
+        A[(!expr) as usize]
+    }
+
+    const SZ_ELF_HDR_64: () = assert(sz::<ElfFileHeader   >() == 64);
+    const SZ_PRG_HDR_64: () = assert(sz::<ElfProgramHeader>() == 56);
+    const SZ_REL_16:     () = assert(sz::<ElfRel          >() == 16);
+    const SZ_RELA_24:    () = assert(sz::<ElfRela         >() == 24);
 }

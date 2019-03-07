@@ -1,17 +1,13 @@
 
-use crate::elf::ElfDyn ;
 use crate::{
-    PAGE_SIZE,
     LoadElfError, Elf, LoadedElf,
     SegmentKind, SegmentStack,
     ProgramHeader,
 };
-use core::{ ptr, mem };
+use core::ptr;
 
 
 
-/// Tries loading a parsed ELF binary into a pre-allocated memory region and relocating
-/// it to the specified base address.
 pub fn try_load_elf<'a>(elf: &Elf<'_>, mem: &'a mut [u8])
 -> Result<LoadedElf<'a>, LoadElfError> {
     check_buffer_requirements_and_zerofill(elf, mem)?;
@@ -28,12 +24,11 @@ pub fn try_load_elf<'a>(elf: &Elf<'_>, mem: &'a mut [u8])
             SegmentKind::Dynamic => match dyns.take() {
                 Some(_) => return Err(LoadElfError::MultipleDynamicSegments),
                 None    => {
+                    // TODO make offset relative to load base?
                     segs.try_push(&ph)?;
                     load_segment(&ph, mem);
 
-                    let start = (ph.page_offset * PAGE_SIZE) as usize;
-                    let len   = ph.copy_from.len() / mem::size_of::<ElfDyn>();
-                    dyns = Some((start, len));
+                    dyns = Some(ph.load_range.convert());
                 },
             },
             SegmentKind::Relro       => segs.try_push(&ph)?,
@@ -41,10 +36,9 @@ pub fn try_load_elf<'a>(elf: &Elf<'_>, mem: &'a mut [u8])
         }
     }
 
-    let (dyn_start, dyn_len) = dyns.ok_or(LoadElfError::NoDynamicSegments)?;
-
     Ok(LoadedElf {
-        mem, dyn_start, dyn_len,
+        mem, dyns: dyns.ok_or(LoadElfError::NoDynamicSegments)?,
+        mem_align: elf.mem_align(),
         entry:     elf.entry,
         protect:   segs,
     })
@@ -54,12 +48,12 @@ pub fn try_load_elf<'a>(elf: &Elf<'_>, mem: &'a mut [u8])
 
 fn check_buffer_requirements_and_zerofill(elf: &Elf<'_>, mem: &mut [u8])
 -> Result<(), LoadElfError> {
-    if mem.len() < ((elf.num_pages() as usize).wrapping_mul(PAGE_SIZE as usize)) {
+    if mem.len() < (elf.mem_len() as usize) {
         return Err(LoadElfError::BadBufferSize);
     }
 
-    // FIXME store min alignment in `Elf`?
-    if 0 != ((mem.as_ptr() as usize) % (PAGE_SIZE as usize)) {
+    // FIXME Store log2 alignment in `elf`?
+    if 0 != ((mem.as_ptr() as usize) % (elf.mem_align() as usize)) {
         return Err(LoadElfError::BadBufferAlignment);
     }
 
@@ -70,9 +64,15 @@ fn check_buffer_requirements_and_zerofill(elf: &Elf<'_>, mem: &mut [u8])
 }
 
 fn load_segment(ph: &ProgramHeader, mem: &mut [u8]) {
-    let start = (ph.page_offset * PAGE_SIZE) as usize;
-    let end   = ph.copy_from.len() + start;
-    let dst   = &mut mem[start..end];
+    // We already bounds-checked `load_range` while parsing, and we already ensured that
+    // this invariant holds as well. This prevents the compiler from inserting `panic!`s
+    // when generating optimised code, due to slice bounds checks.
+    let dst = unsafe { ph.load_range.as_slice_mut(mem) };
 
-    dst.copy_from_slice(ph.copy_from);
+    if dst.len() < ph.copy_from.len() {
+        unsafe { ::core::hint::unreachable_unchecked() }
+    }
+
+    (&mut dst[..ph.copy_from.len()])
+        .copy_from_slice(ph.copy_from);
 }

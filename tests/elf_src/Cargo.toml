@@ -1,0 +1,26 @@
+[package]
+name    = "test"
+version = "0.0.0"
+authors = []
+publish = false
+
+[profile.release]
+panic = "abort"
+
+[[bin]]
+name    = "simple"
+path    = "./simple.rs"
+test    = false
+doctest = false
+bench   = false
+doc     = false
+harness = false
+
+[[bin]]
+name    = "bss_rodata_data"
+path    = "./bss_rodata_data.rs"
+test    = false
+doctest = false
+bench   = false
+doc     = false
+harness = false

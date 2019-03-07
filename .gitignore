@@ -1,3 +1,4 @@
 /target
+/tests/elf_src/target
 **/*.rs.bk
 Cargo.lock

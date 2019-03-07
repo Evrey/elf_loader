@@ -1,5 +1,5 @@
 
-use crate::{ LoadedElf, RelocElfError, ProtectFn, SegmentProtection, PAGE_SIZE };
+use crate::{ LoadedElf, RelocElfError, ProtectFn, SegmentProtection };
 use crate::elf::{
     ElfDyn, ElfRel, ElfRela,
     DT_REL, DT_RELSZ, DT_RELENT, DT_RELA, DT_RELASZ, DT_RELAENT,
@@ -10,20 +10,19 @@ use core::{ mem, slice };
 
 
 
-pub fn try_reloc_elf(elf: &mut LoadedElf<'_>, base: *const u8, prot: Option<ProtectFn>)
+pub fn try_reloc_elf(elf: &mut LoadedElf<'_>, base: *mut u8, prot: Option<ProtectFn>)
 -> Result<(), RelocElfError> {
-    let base_off = base_to_offset(base)?;
+    let base_off = base_to_offset(elf.mem_align(), base)?;
 
     relocate_segments(elf, base_off)?;
 
-    protect_segments(elf, prot)
+    protect_segments(elf, base, prot)
 }
 
-fn protect_segments(elf: &mut LoadedElf<'_>, prot: Option<ProtectFn>)
+fn protect_segments(elf: &mut LoadedElf<'_>, v_base: *mut u8, prot: Option<ProtectFn>)
 -> Result<(), RelocElfError> {
     if let Some(prot) = prot {
-        let p_base  = elf.mem.as_ptr();
-        let v_base  = elf.loader_base();
+        let p_base  = elf.mem.as_mut_ptr();
         let mem_len = elf.mem.len();
 
         // Initial protection request to make everything read-only. This way no unused memory
@@ -38,9 +37,7 @@ fn protect_segments(elf: &mut LoadedElf<'_>, prot: Option<ProtectFn>)
             (prot)(
                 seg.protect,
                 p_base, v_base, mem_len,
-                ((seg.page_off as usize) * (PAGE_SIZE as usize))
-                ..
-                (((seg.page_off).wrapping_add(seg.page_num) as usize) * (PAGE_SIZE as usize))
+                seg.range.to_byte_range()
             ).map_err(|_| RelocElfError::MemProtectFailed)?;
         }
     }
@@ -48,10 +45,10 @@ fn protect_segments(elf: &mut LoadedElf<'_>, prot: Option<ProtectFn>)
     Ok(())
 }
 
-fn base_to_offset(base: *const u8) -> Result<usize, RelocElfError> {
+fn base_to_offset(align: u32, base: *mut u8) -> Result<usize, RelocElfError> {
     let off = base as usize;
 
-    match off % (PAGE_SIZE as usize) {
+    match off % (align as usize) {
         0 =>  Ok(off),
         _ => Err(RelocElfError::BadBaseAddressAlignment),
     }
@@ -59,27 +56,23 @@ fn base_to_offset(base: *const u8) -> Result<usize, RelocElfError> {
 
 fn relocate_segments(elf: &mut LoadedElf<'_>, off: usize)
 -> Result<(), RelocElfError> {
-    // FIXME Very unsafe black magic. Ideally prove that this won't be a problem.
-    //       I.e. ensure that to-be-relocated stuff and the `ElfDyn` array don't overlap.
+    use self::RelocElfError::*;
+
     let mem_base      = elf.mem.as_mut_ptr();
     let mem_len       = elf.mem.len();
-    let (rels, relas) = find_rels_and_relas(elf.mem, elf.dyn_start, elf.dyn_len)?;
+    let dyns          = elf.dyns.try_slice(elf.mem, BadDynAlignment)?;
+    let (rels, relas) = find_rels_and_relas(elf.mem, dyns)?;
 
+    // FIXME Does the ELF spec say something about "either, or"? Where even is the ELF spec?!
     for rel  in rels  { apply_rel( rel , mem_base, mem_len, off)?; }
     for rela in relas { apply_rela(rela, mem_base, mem_len, off)?; }
 
     Ok(())
 }
 
-fn find_rels_and_relas<'a>(mem: &'a [u8], dyn_start: usize, dyn_len: usize)
+fn find_rels_and_relas<'a>(mem: &'a [u8], dyns: &'a [ElfDyn])
 -> Result<(&'a [ElfRel], &'a [ElfRela]), RelocElfError> {
-    // FIXME maybe move this stuff here into the loading function?
-    // TODO align-check this
-    let dyns: &[ElfDyn] = unsafe { slice::from_raw_parts(
-        mem[dyn_start..].as_ptr() as *const ElfDyn,
-        dyn_len
-    )};
-
+    // FIXME move to load?
     let mut  rel_table_off = 0_u64;
     let mut  rel_table_len = 0_u64;
 

@@ -17,10 +17,14 @@ A dead simple crate for ELF64 parsing and loading.
 
 ## TODOs
 
-- Currently, only re-locatable `x86_64` executables are supported. However, at least support for
-  AArch64 and RISC-V is planned.
+- Currently, only page-aligned re-locatable `x86_64` executables are supported. However, at least
+  support for AArch64 and RISC-V is planned.
 - An other "not yet implemented" feature is dynamic linking. This is required to eventually make
-  this crate a minimal drop-in replacement for `dlopen`.
+  this crate a minimal drop-in replacement for `dlopen`. You cannot currently look up symbols, so
+  all you get from loading an ELF is its entry point.
+- Currently, custom linker scripts have to be used that page-align all loadable sections. To relax
+  this requirement, I'd need help finding and understanding the source code of `ld.so` from `glibc`.
+  I.e. this crate does not currently act as a program interpreter.
 - Just `Ctrl`+`F` this crate for `TODO` and `FIXME`. ಥ‿ಥ
 - Guarantee 100% that no `panic!`s will occur.
 
@@ -34,22 +38,21 @@ is as easy as following these few steps:
    are also ELF files.
 2. Call `Elf::try_parse` with your ELF slice. On success it will return a small parsed `Elf`
    struct.
-3. Call the `Elf`'s `num_pages` function and multiply the result by `PAGE_SIZE`. This is the
-   amount of page-aligned memory, in bytes, that you have to allocate for the next steps.
+3. Call the `Elf`'s `mem_len` and `mem_align` functions. Those will give you the layout information
+   needed to allocate a buffer for the next step.
 4. Call `Elf::try_load` with the `Elf` struct and a mutable slice of your newly allocated
    memory. This will copy all necessary segments into the new memory region after zero-filling it
    first. On success, the result is a `LoadedElf` struct which holds a mutable borrow to your
    allocated memory.
-5. Call `LoadedElf::try_reloc` with the `ParsedElf` struct and a chosen virtual base address. The
-   base address is where the final running program will think its first memory page is located.
-   This allows you to re-locate an ELF from within a different address space. If you don't
+5. Call `LoadedElf::try_reloc` with a chosen virtual base address and an optional memory protection
+   callback. The base address is where the final running program will think its first memory page is
+   located. This allows you to re-locate an ELF from within a different address space. If you don't
    change the memory mapping of the loaded ELF, then the base address is the pointer of your
    allocated memory block's slice. You can get this pointer from `LoadedElf::loader_base`.
-6. The re-location function takes an additional parameter: An optional function pointer for a
-   callback. This callback receives memory ranges and the requested memory protection levels. You
-   can use this callback to actually apply memory protection flags as specified by the ELF data.
-   Do not assume that protection regions won't overlap and just blindly handle each request in
-   order.
+6. The memory protection function receives base addresses, a slice, and the requested memory
+   protection level. You can use this callback to actually apply memory protection flags as
+   specified by the ELF data. Do not assume that protection regions won't overlap and just blindly
+   handle each request in order.
 7. On success, the `LoadedElf::try_reloc` function returns a `ReadyElf`. This struct provides
    functions needed to run the ELF or grab its memory range.
 
@@ -58,27 +61,29 @@ is as easy as following these few steps:
 ```
 # use elf_loader::*;
 # use std::mem;
-# fn get_buffer() -> &'static [u8] { &[][..] }
+# fn get_aligned_buffer() -> &'static [u8] { &[][..] }
 # fn alloc_aligned(_: usize, _: usize) -> &'static mut [u8] { &mut [][..] }
 # fn dealloc(_: &[u8]) {}
 # fn main() {
 #     fn sub() -> Result<(), ElfError> {
 #         let protection_fn = protect_noop;
 // Grab a buffer containing ELF data.
-let elf_data = get_buffer();
+let elf_data = get_aligned_buffer();
 
 // Try parsing the buffer as ELF data.
 let elf = Elf::try_parse(elf_data)?;
 
 // For the next step, we need to allocate a bunch of page-aligned memory.
 // You might as well use a pre-allocated buffer from your `.bss` section.
-let align = PAGE_SIZE as usize;
-let size  = (elf.num_pages() * PAGE_SIZE) as usize;
+let align = elf.mem_align() as usize;
+let size  = elf.mem_len()   as usize;
 let mem   = alloc_aligned(size, align);
 
 // Now, load the ELF into our allocated memory. After that, you are free to throw
 // `elf_data` and `elf` out of the window.
-let loaded_elf = elf.try_load(mem)?;
+let mut loaded_elf = elf.try_load(mem)?;
+drop(elf);
+drop(elf_data);
 
 // The next step is to re-locate and memory-protect our ELF. To do that we first need
 // a base address. If you intend to run the loaded ELF as a plugin in your own address
@@ -112,6 +117,22 @@ dealloc(ready.p_mem());
 #     let _ = sub();
 # }
 ```
+
+## B-but why?!
+
+I have two personal goals for this crate.
+
+One is to use it in my toy OS to unpack the kernels etc. from the OS loader,
+without needing some fancy virtual init file system. Eventually, in a century,
+it might even load user-space applications.
+
+The other goal is to use it as an embeddable `dlopen`-replacement for plugins with
+a minimum amount of dependencies. You could load the same ELF plugin into a Windows
+or Linux build of your application. Just exchange some v-tables on plugin entry.
+
+In both cases, possibly illformed ELF data should not cause any kind of undefined or
+undesired behaviour, from parsing to re-locating. Your only security risk should be
+calling the entry function.
  */
 
 #![no_std]
@@ -120,7 +141,9 @@ dealloc(ready.p_mem());
 // TODO add thread-local storage (TLS) support
 
 use core::slice::{ self, Iter };
+use core::marker::PhantomData;
 use core::ops::Range;
+use core::mem;
 
 
 
@@ -133,7 +156,7 @@ mod reloc;
 pub use self::error::{ ElfError, ParseElfError, LoadElfError, RelocElfError };
 
 use self::elf::{
-    ElfProgramHeader,
+    ElfProgramHeader, ElfDyn,
     PF_R, PF_W, PF_X, PF_RW, PF_RX,
     PT_DYNAMIC, PT_GNU_RELRO, PT_GNU_STACK, PT_LOAD, PT_NULL,
 };
@@ -141,17 +164,6 @@ use self::elf::{
 use self::parse::try_parse_elf;
 use self::load::try_load_elf;
 use self::reloc::try_reloc_elf;
-
-
-
-/// Smallest virtual memory page size on the target platform, in bytes.
-///
-/// ELF segments are usually loaded and modified in page-sized chunks, and to allow some
-/// optimisations not done by this loader, ELF segment data is therefore typically even
-/// page-aligned within the ELF file. (Memory-map and mutate in-place.)
-// FIXME conditional for supported archs? crate if notable differences? Halpz!
-// FIXME or maybe kill that and use byte lengths and offsets?
-pub const PAGE_SIZE: u32 = 4096;
 
 
 
@@ -163,8 +175,9 @@ pub const PAGE_SIZE: u32 = 4096;
 #[derive(Clone)]
 pub struct Elf<'a> {
     program_headers: ProgramHeaders<'a>,
-    num_pages: u32,
-    entry: u32,
+    mem_len:   u32,
+    mem_align: u32,
+    entry:     u32,
 }
 
 impl<'a> Elf<'a> {
@@ -178,8 +191,7 @@ impl<'a> Elf<'a> {
     /// This does not yet re-locate or memory-protect the loaded ELF, in case you want to
     /// delay those steps or handle them in another process or thread.
     ///
-    /// The given buffer must be page-aligned and big enough to hold at least `num_pages`
-    /// pages of ELF segments.
+    /// The given buffer must have `mem_align` alignment and be at least `mem_len` bytes in size.
     pub fn try_load<'b>(&self, mem: &'b mut [u8]) -> Result<LoadedElf<'b>, LoadElfError> {
         try_load_elf(self, mem)
     }
@@ -189,9 +201,14 @@ impl<'a> Elf<'a> {
         self.program_headers.clone()
     }
 
-    /// Number of contiguous memory pages to allocate in order to load the ELF.
-    pub fn num_pages(&self) -> u32 {
-        self.num_pages
+    /// Minimum number of bytes to allocate to load this ELF.
+    pub fn mem_len(&self) -> u32 {
+        self.mem_len
+    }
+
+    /// Minimum alignment, in bytes, of the to-be-allocated load buffer.
+    pub fn mem_align(&self) -> u32 {
+        self.mem_align
     }
 }
 
@@ -201,8 +218,8 @@ impl<'a> Elf<'a> {
 // TODO serialisability, possibly MessagePack, Binn?
 pub struct LoadedElf<'a> {
     mem:       &'a mut [u8],
-    dyn_start: usize,
-    dyn_len:   usize,
+    dyns:      Slice32<ElfDyn>,
+    mem_align: u32,
     entry:     u32,
     protect:   SegmentStack,
 }
@@ -217,7 +234,7 @@ impl<'a> LoadedElf<'a> {
     ///   levels. In such cases newer protection requests overrule older ones. This argument is
     ///   optional, as for some systems, like for UEFI, there is no proper way of restricting
     ///   memory access rights.
-    pub fn try_reloc(mut self, base: *const u8, prot: Option<ProtectFn>)
+    pub fn try_reloc(mut self, base: *mut u8, prot: Option<ProtectFn>)
     -> Result<ReadyElf<'a>, (&'a mut [u8], RelocElfError)> {
         let res   = try_reloc_elf(&mut self, base, prot);
         let mem   = self.mem;
@@ -230,8 +247,18 @@ impl<'a> LoadedElf<'a> {
     }
 
     /// The final re-located ELF's base address within the ELF loader's address space.
-    pub fn loader_base(&self) -> *const u8 {
-        self.mem.as_ptr()
+    pub fn loader_base(&mut self) -> *mut u8 {
+        self.mem.as_mut_ptr()
+    }
+
+    /// Minimum number of bytes to allocate to load this ELF.
+    pub fn mem_len(&self) -> usize {
+        self.mem.len()
+    }
+
+    /// Minimum alignment, in bytes, of the to-be-allocated load buffer.
+    pub fn mem_align(&self) -> u32 {
+        self.mem_align
     }
 }
 
@@ -245,8 +272,8 @@ impl<'a> LoadedElf<'a> {
 ///   defined by one of the base addresses and `mem_len`.
 pub type ProtectFn = extern "C" fn(
     prot:    SegmentProtection,
-    p_base:  *const u8,
-    v_base:  *const u8,
+    p_base:  *mut u8,
+    v_base:  *mut u8,
     mem_len: usize,
     range:   Range<usize>,
 ) -> Result<(), ()>;
@@ -256,7 +283,7 @@ pub type ProtectFn = extern "C" fn(
 /// Useful for systems like UEFI where there either is no way of protecting memory,
 /// or where the system's API does not provide any methods to do such a thing.
 pub extern "C" fn protect_noop(
-    _: SegmentProtection, _: *const u8, _: *const u8, _: usize, _: Range<usize>
+    _: SegmentProtection, _: *mut u8, _: *mut u8, _: usize, _: Range<usize>
 ) -> Result<(), ()> {
     Ok(())
 }
@@ -271,9 +298,8 @@ impl SegmentStack {
         Self {
             len:  0,
             data: [Segment {
-                page_off: 0,
-                page_num: 0,
-                protect:  SegmentProtection::RO,
+                range:   Slice32::new(0, 0),
+                protect: SegmentProtection::RO,
             }; 8],
         }
     }
@@ -284,9 +310,8 @@ impl SegmentStack {
         }
 
         self.data[self.len as usize] = Segment {
-            page_off: ph.page_offset,
-            page_num: ph.page_num,
-            protect:  ph.protection,
+            range:   ph.load_range,
+            protect: ph.protection,
         };
         self.len += 1;
 
@@ -296,9 +321,8 @@ impl SegmentStack {
 
 #[derive(Copy, Clone)]
 struct Segment {
-    page_off: u32,
-    page_num: u32,
-    protect:  SegmentProtection,
+    range:   Slice32<u8>,
+    protect: SegmentProtection,
 }
 
 
@@ -387,6 +411,7 @@ impl SegmentKind {
 
 
 /// An ELF program header, which is basically an instruction an ELF loader executes.
+// FIXME How does one handle alignment here? `readelf` reports offsets that don't fit alignment.
 #[derive(Copy, Clone, Debug)]
 pub struct ProgramHeader<'a> {
     /// What the current header wants us to do.
@@ -395,13 +420,12 @@ pub struct ProgramHeader<'a> {
     /// What kind of memory protection to apply.
     pub protection: SegmentProtection,
 
-    /// Offset of this segment, in multiples of 4KiB.
-    pub page_offset: u32,
-
-    /// Number of 4KiB pages in this segment.
-    pub page_num: u32,
+    /// A slice into the buffer where the ELF is to be loaded.
+    pub load_range: Slice32<u8>,
 
     /// Source of the data to copy.
+    ///
+    /// This is a sub-slice of the original ELF data.
     pub copy_from: &'a [u8],
 }
 
@@ -410,8 +434,7 @@ impl<'a> ProgramHeader<'a> {
         Some(ProgramHeader {
             kind:        SegmentKind      ::from_kind( ph.p_type )?,
             protection:  SegmentProtection::from_flags(ph.p_flags),
-            page_offset: (ph.p_vaddr as u32) / PAGE_SIZE,
-            page_num:    (ph.p_memsz as u32 + (PAGE_SIZE - 1)) / PAGE_SIZE,
+            load_range:  Slice32::new(ph.p_vaddr as u32, ph.p_memsz as u32),
             copy_from:   &elf[
                 (ph.p_offset as usize) .. (ph.p_offset as usize).wrapping_add(ph.p_filesz as usize)
             ],
@@ -449,5 +472,75 @@ impl<'a> ReadyElf<'a> {
     // FIXME return generic function pointer if variadic generics
     pub fn v_entry(&self) -> *const () {
         unsafe { self.base.add(self.entry as usize) as *const () }
+    }
+}
+
+
+
+/// A slice-ish thing that only uses 32-bit offset and length elements.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub struct Slice32<T: Sized + Copy> {
+    pub start: u32, // In 1 byte steps.
+    pub len:   u32, // In multiples of `size_of::<T>()`.
+    _wat: PhantomData<T>,
+}
+
+impl<T: Sized + Copy> Slice32<T> {
+    /// Creates a new slice from starting offset and length.
+    ///
+    /// - `start` is relative to another slice.
+    /// - `len` is in `T`-sized steps.
+    pub fn new(start: u32, len: u32) -> Self {
+        Self { start, len, _wat: PhantomData }
+    }
+
+    /// Creates a byte range for slicing memory.
+    pub fn to_byte_range(self) -> Range<usize> {
+        (self.start as usize)
+        ..
+        (self.start.wrapping_add(self.len.wrapping_mul(mem::size_of::<T>() as u32)) as usize)
+    }
+
+    /// Tries to grab a sub-slice of `T`s from `mem`.
+    ///
+    /// Fails if the sub-slice would have bad alignment.
+    pub(crate) fn try_slice<'a, E>(self, mem: &'a [u8], bad_align: E)
+    -> Result<&'a [T], E> {
+        // No bounds checking required, will have been done at parsing time.
+        let base = unsafe { mem.as_ptr().add(self.start as usize) } as *const T;
+
+        if 0 != ((base as usize) % mem::align_of::<T>()) {
+            return Err(bad_align);
+        }
+
+        Ok(unsafe { slice::from_raw_parts(base, self.len as usize) })
+    }
+
+    /// A specialisation of `try_slice` that avoids alignment checks.
+    ///
+    /// This is safe if `T == u8`, otherwise stay away from it.
+    // FIXME Rather specialise `try_slice` for `u8` and `Result<&'a [u8], !>`, if stable `!`.
+    pub unsafe fn as_slice<'a>(self, mem: &'a [u8]) -> &'a [T] {
+        slice::from_raw_parts(
+            mem.as_ptr().add(self.start as usize) as *const T,
+            self.len as usize
+        )
+    }
+
+    /// Like `as_slice`, but grabs a mutable reference. Again, no alignment checks.
+    pub unsafe fn as_slice_mut<'a>(self, mem: &'a mut [u8]) -> &'a mut [T] {
+        slice::from_raw_parts_mut(
+            mem.as_mut_ptr().add(self.start as usize) as *mut T,
+            self.len as usize
+        )
+    }
+
+    /// Because `libcore` complains about the case where `T == U`, and I cannot
+    /// opt-out of it.
+    pub fn convert<U: Sized + Copy>(self) -> Slice32<U> {
+        Slice32::new(
+            self.start,
+            (((self.len as usize) * mem::size_of::<T>()) / mem::size_of::<U>()) as u32
+        )
     }
 }

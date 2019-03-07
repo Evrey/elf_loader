@@ -6,17 +6,17 @@ use crate::elf::{
     EM_AARCH64, EM_RISCV, EM_X86_64,
     PF_X, PT_LOAD,
 };
-use crate::{ PAGE_SIZE, ParseElfError, Elf, ProgramHeaders };
+use crate::{ ParseElfError, Elf, ProgramHeaders };
 use core::slice::{ self, Iter };
 use core::mem;
 
 
 
 pub fn try_parse_elf<'a>(raw: &'a [u8]) -> Result<Elf<'a>, ParseElfError> {
-    let  header                             = try_load_header(raw)?;
-    let (num_pages, entry, program_headers) = try_load_program_headers(header, raw)?;
+    let  header                                      = try_load_header(raw)?;
+    let (mem_len, mem_align, entry, program_headers) = try_load_program_headers(header, raw)?;
 
-    Ok(Elf { program_headers, num_pages, entry })
+    Ok(Elf { program_headers, mem_len, mem_align, entry })
 }
 
 
@@ -41,7 +41,11 @@ fn try_load_header(raw: &[u8]) -> Result<&ElfFileHeader, ParseElfError> {
         return Err(ParseElfError::BadHeaderSize);
     }
 
-    check_is_elf64(        header.e_ident[EI_CLASS])?;
+    // FIXME maybe allow ELF32 one day
+    if header.e_ident[EI_CLASS] != ELFCLASS64 {
+        return Err(ParseElfError::NotElf64);
+    }
+
     check_is_native_endian(header.e_ident[EI_DATA ])?;
 
     if header.e_type != ET_DYN {
@@ -51,11 +55,6 @@ fn try_load_header(raw: &[u8]) -> Result<&ElfFileHeader, ParseElfError> {
     check_isa(header.e_machine)?; // TODO ? header.e_flags
 
     Ok(header)
-}
-
-fn check_is_elf64(tag: u8) -> Result<(), ParseElfError> {
-    if tag == ELFCLASS64 {       Ok(()) }
-    else { Err(ParseElfError::NotElf64) }
 }
 
 fn check_is_native_endian(tag: u8) -> Result<(), ParseElfError> {
@@ -70,7 +69,7 @@ fn check_is_native_endian(tag: u8) -> Result<(), ParseElfError> {
 fn check_isa(tag: u16) -> Result<(), ParseElfError> {
     let wat = match tag {
         EM_AARCH64 => cfg!(target_arch = "aarch64"),
-        EM_RISCV   => cfg!(target_arch = "riscv32imac"), // TODO this is wrong? maybe?
+        EM_RISCV   => false, // FIXME wait for `rustc` to target RV64
         EM_X86_64  => cfg!(target_arch = "x86_64"),
         // FIXME more archs?
 
@@ -84,7 +83,7 @@ fn check_isa(tag: u16) -> Result<(), ParseElfError> {
 
 
 fn try_load_program_headers<'a>(hdr: &'a ElfFileHeader, raw: &'a [u8])
--> Result<(u32, u32, ProgramHeaders<'a>), ParseElfError> {
+-> Result<(u32, u32, u32, ProgramHeaders<'a>), ParseElfError> {
     if (hdr.e_phentsize as usize) != mem::size_of::<ElfProgramHeader>() {
         return Err(ParseElfError::BadProgramHeaderSize);
     }
@@ -108,22 +107,27 @@ fn try_load_program_headers<'a>(hdr: &'a ElfFileHeader, raw: &'a [u8])
     let hdrs: &[ElfProgramHeader] = unsafe { slice::from_raw_parts(ptr, len) };
 
     // Bounds-check here, so we can blindly slice the ELF buffer later.
-    let n_pages = check_ph_ranges(hdrs.iter(), raw, hdr.e_entry)?;
+    let (mem_len, mem_align) = check_ph_ranges(hdrs.iter(), raw, hdr.e_entry)?;
 
-    Ok((n_pages, hdr.e_entry as u32, ProgramHeaders {
+    Ok((mem_len, mem_align, hdr.e_entry as u32, ProgramHeaders {
         inner: hdrs.iter(),
         elf:   raw,
     }))
 }
 
 fn check_ph_ranges<'a>(hdrs: Iter<'a, ElfProgramHeader>, raw: &'a [u8], ent: u64)
--> Result<u32, ParseElfError> {
-    let mut e = 0;
+-> Result<(u32, u32), ParseElfError> {
+    let mut end_offset   = 0;
+    let mut max_align    = 1;
+    let mut entry_in_exe = false;
 
+    // FIXME Bail out on too high header count?
     for ph in hdrs {
-        if  ph.p_offset.checked_add(ph.p_filesz)
-                       .map(|x| x >= (raw.len() as u64))
-                       .unwrap_or(true) {
+        // `p_offset` and `p_filesz` implicitly checked against a 4GiB limit,
+        // as `raw.len()` has already checked to be at most that.
+        if ph.p_offset.checked_add(ph.p_filesz)
+                      .map(|x| x >= (raw.len() as u64))
+                      .unwrap_or(true) {
             return Err(ParseElfError::BadPhRange);
         }
 
@@ -134,20 +138,32 @@ fn check_ph_ranges<'a>(hdrs: Iter<'a, ElfProgramHeader>, raw: &'a [u8], ent: u64
             return Err(ParseElfError::BadVmemRange);
         }
 
-        if ((ph.p_type, ph.p_flags & PF_X) == (PT_LOAD, PF_X))
-         & ((ent < ph.p_vaddr) | (ent > ph.p_vaddr.wrapping_add(ph.p_memsz))) {
-            // FIXME In case there are - for whatever reason - valid ELFs with multiple
-            //       executable segments, change this code to instead check whether the
-            //       entry point lies within a non-executable segment.
-            return Err(ParseElfError::BadEntry);
+        if ph.p_memsz < ph.p_filesz {
+            return Err(ParseElfError::PhSmallerThanVmem);
         }
 
-        let end = (
-            ((ph.p_vaddr + ph.p_memsz) + ((PAGE_SIZE - 1) as u64)) / (PAGE_SIZE as u64)
-        ) as u32;
+        if ent != 0 {
+            if ((ph.p_type, ph.p_flags & PF_X) == (PT_LOAD, PF_X))
+            & ((ent >= ph.p_vaddr) & (ent < ph.p_vaddr.wrapping_add(ph.p_memsz))) {
+                // In case there are - for whatever reason - valid ELF files with many
+                // executable segments, delaying the error return allows us to check
+                // the entry address against all of them.
+                entry_in_exe = true;
+            }
+        }
 
-        if end > e { e = end; }
+        let end   = (ph.p_vaddr.wrapping_add(ph.p_memsz)) as u32;
+        let align = if ph.p_align <= (u32::max_value() as u64) { ph.p_align as u32 }
+                    else { return Err(ParseElfError::ExcessiveAlignment); };
+
+        if end   > end_offset { end_offset = end;   }
+        if align > max_align  { max_align  = align; }
     }
 
-    Ok(e)
+    // FIXME For shared objects, it seems to be the case that `ent==0` means no entry. Check this.
+    if (ent != 0) & (!entry_in_exe) {
+        return Err(ParseElfError::BadEntry);
+    }
+
+    Ok((end_offset, max_align))
 }

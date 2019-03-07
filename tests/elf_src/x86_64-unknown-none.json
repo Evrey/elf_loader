@@ -1,0 +1,40 @@
+{
+    "llvm-target": "x86_64-unknown-none",
+    "arch":        "x86_64",
+    "vendor":      "unknown",
+    "os":          "none",
+
+    "data-layout":          "e-m:e-i64:64-f80:128-n8:16:32:64-S128",
+    "target-endian":        "little",
+    "target-pointer-width": "64",
+    "target-c-int-width":   "32",
+    "max-atomic-width":     "64",
+    "i128-lowering":        true,
+
+    "executables":                      true,
+    "dynamic-linking":                  false,
+    "position-independent-executables": true,
+    "relocation-model":                 "pic",
+    "code-model":                       "small",
+    "linker":                           "rust-lld",
+    "linker-flavor":                    "ld.lld",
+    "no-default-libraries":             true,
+    "allow-asm":                        true,
+    "singlethread":                     true,
+
+    "panic-strategy":  "abort",
+    "disable-redzone": true,
+    "features":        "-mmx,-sse,+soft-float",
+
+    "pre-link-args":  { "ld.lld": [
+        "-T", "./x86_64-unknown-none.ld",
+        "--discard-all",
+        "--strip-all",
+        "--gc-sections",
+        "--oformat", "elf64-x86-64",
+        "--pic-executable", "--pie"
+    ]},
+    "default-hidden-visibility": true,
+    "is-like-windows":           false,
+    "emit-debug-gdb-scripts":    false
+}
